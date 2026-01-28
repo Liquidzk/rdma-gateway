@@ -436,6 +436,7 @@ func doPut(s *clientSession, reqID uint32, bucket, key string, data []byte) erro
 	if lease.MaxLen < uint32(len(data)) {
 		return fmt.Errorf("object too large for lease")
 	}
+	fmt.Printf("PUT lease req=%d addr=0x%x rkey=0x%x max=%d len=%d\n", reqID, lease.Addr, lease.RKey, lease.MaxLen, len(data))
 
 	local, err := rdma.AllocBuffer(len(data))
 	if err != nil {

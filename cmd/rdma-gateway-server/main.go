@@ -269,6 +269,8 @@ func (s *serverSession) handlePutReq(req proto.PutReq) {
 	s.putState[req.ReqID] = putState{lease: lease, bucket: req.Bucket, key: req.Key, objLen: req.ObjLen}
 	s.stateMu.Unlock()
 
+	fmt.Printf("PUT lease req=%d addr=0x%x rkey=0x%x max=%d\\n", req.ReqID, lease.Addr, lease.RKey, lease.MaxLen)
+
 	msg := proto.PutLease{ReqID: req.ReqID, Token: lease.Token, Addr: lease.Addr, RKey: lease.RKey, MaxLen: uint32(lease.MaxLen)}
 	buf := s.allocSendBuf()
 	if buf == nil {
