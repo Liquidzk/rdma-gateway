@@ -220,6 +220,7 @@ int rdma_listen_accept(struct rdma_listener *listener, struct rdma_conn **out) {
     param.initiator_depth = 1;
     param.responder_resources = 1;
     param.retry_count = 7;
+    param.rnr_retry_count = 7;
 
     if (rdma_accept(id, &param)) {
         rdma_destroy_qp(id);
@@ -340,6 +341,7 @@ int rdma_dial(const char *server_ip, int port, struct rdma_conn **out) {
     param.initiator_depth = 1;
     param.responder_resources = 1;
     param.retry_count = 7;
+    param.rnr_retry_count = 7;
 
     if (rdma_connect(id, &param)) {
         rdma_destroy_qp(id);
