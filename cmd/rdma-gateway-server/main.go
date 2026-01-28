@@ -146,7 +146,7 @@ func serverHello(conn *rdma.Conn) error {
 
 	var hdr proto.MsgHdr
 	recvDone := false
-	deadline := time.Now().Add(5 * time.Second)
+	deadline = time.Now().Add(5 * time.Second)
 	for !recvDone {
 		op, buf, n, err := conn.Poll(200)
 		if err != nil {
