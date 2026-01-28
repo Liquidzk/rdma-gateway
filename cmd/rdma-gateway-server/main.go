@@ -11,6 +11,7 @@ import (
 	"os"
 	"runtime"
 	"sync"
+	"time"
 	"unsafe"
 
 	"rdma_gateway_go/internal/backend"
@@ -233,6 +234,7 @@ func (s *serverSession) dispatchLoop() {
 			if err != nil {
 				continue
 			}
+			fmt.Printf("PUT commit req=%d len=%d\n", commit.ReqID, commit.DataLen)
 			s.handlePutCommit(commit)
 		case proto.MsgGetReq:
 			req, err := proto.DecodeGetReq(msg)
@@ -317,6 +319,7 @@ func (s *serverSession) handlePutCommit(commit proto.PutCommit) {
 	}
 
 	s.workCh <- func() {
+		start := time.Now()
 		payload, err := rdma.GoBytesFromAddr(st.lease.Addr, int(commit.DataLen))
 		if err != nil {
 			s.sendPutDone(commit.ReqID, 1)
@@ -325,13 +328,16 @@ func (s *serverSession) handlePutCommit(commit proto.PutCommit) {
 			return
 		}
 		sum := sha256.Sum256(payload)
-		if err := s.backend.Put(context.Background(), commit.Bucket, commit.Key, bytes.NewReader(payload), int64(commit.DataLen)); err != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := s.backend.Put(ctx, commit.Bucket, commit.Key, bytes.NewReader(payload), int64(commit.DataLen)); err != nil {
+			fmt.Printf("PUT backend error req=%d err=%v\n", commit.ReqID, err)
 			s.sendPutDone(commit.ReqID, 1)
 			_ = s.waitPool().Release(st.lease.Token)
 			s.clearPut(commit.ReqID)
 			return
 		}
-		fmt.Printf("PUT sha256=%s bucket=%s key=%s len=%d\n", hex.EncodeToString(sum[:]), commit.Bucket, commit.Key, commit.DataLen)
+		fmt.Printf("PUT sha256=%s bucket=%s key=%s len=%d took=%s\n", hex.EncodeToString(sum[:]), commit.Bucket, commit.Key, commit.DataLen, time.Since(start))
 		s.sendPutDone(commit.ReqID, 0)
 		_ = s.waitPool().Release(st.lease.Token)
 		s.clearPut(commit.ReqID)
