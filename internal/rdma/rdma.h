@@ -2,6 +2,8 @@
 #define RDMA_WRAPPER_H
 
 #include <stdint.h>
+#include <stddef.h>
+#include <infiniband/verbs.h>
 
 struct rdma_listener;
 struct rdma_conn;
