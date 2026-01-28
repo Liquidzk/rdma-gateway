@@ -11,7 +11,6 @@ import (
 	"os"
 	"runtime"
 	"sync"
-	"time"
 	"unsafe"
 
 	"rdma_gateway_go/internal/backend"
@@ -105,11 +104,6 @@ func main() {
 
 	fmt.Println("ESTABLISHED")
 
-	if err := serverHello(conn); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
-	}
-
 	mr, err := conn.AllocAndRegisterMR(64 * 1024 * 1024)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -131,106 +125,6 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-}
-
-func serverHello(conn *rdma.Conn) error {
-	recvBuf, err := rdma.AllocBuffer(ctrlBufSize)
-	if err != nil {
-		return err
-	}
-
-	if err := conn.PostRecv(recvBuf); err != nil {
-		_ = conn.DeregisterBuffer(recvBuf)
-		return err
-	}
-
-	var hdr proto.MsgHdr
-	recvDone := false
-	deadline := time.Now().Add(5 * time.Second)
-	for !recvDone {
-		op, buf, n, err := conn.Poll(200)
-		if err != nil {
-			_ = conn.DeregisterBuffer(recvBuf)
-			rdma.FreeBuffer(recvBuf)
-			return err
-		}
-		if op == rdma.OpRecv {
-			if n < proto.HeaderLen {
-				_ = conn.DeregisterBuffer(recvBuf)
-				rdma.FreeBuffer(recvBuf)
-				return fmt.Errorf("unexpected completion")
-			}
-			h, err := proto.ReadHeader(buf[:proto.HeaderLen])
-			if err != nil {
-				_ = conn.DeregisterBuffer(recvBuf)
-				rdma.FreeBuffer(recvBuf)
-				return err
-			}
-			if h.Magic != proto.Magic || h.Version != proto.Version || h.Type != proto.MsgHello {
-				_ = conn.DeregisterBuffer(recvBuf)
-				rdma.FreeBuffer(recvBuf)
-				return fmt.Errorf("invalid hello")
-			}
-			hdr = h
-			recvDone = true
-		}
-		if time.Now().After(deadline) {
-			_ = conn.DeregisterBuffer(recvBuf)
-			rdma.FreeBuffer(recvBuf)
-			return fmt.Errorf("hello timeout")
-		}
-	}
-
-	sendBuf, err := rdma.AllocBuffer(ctrlBufSize)
-	if err != nil {
-		_ = conn.DeregisterBuffer(recvBuf)
-		rdma.FreeBuffer(recvBuf)
-		return err
-	}
-
-	ack := proto.MsgHdr{
-		Magic:   proto.Magic,
-		Version: proto.Version,
-		Type:    proto.MsgHelloAck,
-		ReqID:   hdr.ReqID,
-		BodyLen: 0,
-	}
-	if err := proto.WriteHeader(sendBuf[:proto.HeaderLen], ack); err != nil {
-		_ = conn.DeregisterBuffer(sendBuf)
-		_ = conn.DeregisterBuffer(recvBuf)
-		rdma.FreeBuffer(sendBuf)
-		rdma.FreeBuffer(recvBuf)
-		return err
-	}
-	if err := conn.Send(sendBuf[:proto.HeaderLen]); err != nil {
-		_ = conn.DeregisterBuffer(sendBuf)
-		_ = conn.DeregisterBuffer(recvBuf)
-		rdma.FreeBuffer(sendBuf)
-		rdma.FreeBuffer(recvBuf)
-		return err
-	}
-
-	sendDone := false
-	deadline = time.Now().Add(5 * time.Second)
-	for !sendDone {
-		op, buf, _, err := conn.Poll(200)
-		if err != nil {
-			return err
-		}
-		if op == rdma.OpSend {
-			if buf != nil && len(buf) > 0 && &buf[0] == &sendBuf[0] {
-				sendDone = true
-			}
-		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("hello timeout")
-		}
-	}
-	_ = conn.DeregisterBuffer(sendBuf)
-	_ = conn.DeregisterBuffer(recvBuf)
-	rdma.FreeBuffer(sendBuf)
-	rdma.FreeBuffer(recvBuf)
-	return nil
 }
 
 func newServerSession(conn *rdma.Conn, pool *bufpool.Pool, backendClient *backend.MinioBackend) *serverSession {
@@ -312,6 +206,8 @@ func (s *serverSession) dispatchLoop() {
 			continue
 		}
 		switch hdr.Type {
+		case proto.MsgHello:
+			s.handleHello(hdr)
 		case proto.MsgPutReq:
 			req, err := proto.DecodePutReq(msg)
 			if err != nil {
@@ -338,6 +234,25 @@ func (s *serverSession) dispatchLoop() {
 			s.handleGetDone(done)
 		}
 	}
+}
+
+func (s *serverSession) handleHello(hdr proto.MsgHdr) {
+	buf := s.allocSendBuf()
+	if buf == nil {
+		return
+	}
+	ack := proto.MsgHdr{
+		Magic:   proto.Magic,
+		Version: proto.Version,
+		Type:    proto.MsgHelloAck,
+		ReqID:   hdr.ReqID,
+		BodyLen: 0,
+	}
+	if err := proto.WriteHeader(buf[:proto.HeaderLen], ack); err != nil {
+		rdma.FreeBuffer(buf)
+		return
+	}
+	s.send(buf[:proto.HeaderLen])
 }
 
 func (s *serverSession) handlePutReq(req proto.PutReq) {
