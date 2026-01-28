@@ -52,6 +52,8 @@ type serverSession struct {
 	getState map[uint32]getState
 
 	workCh chan func()
+
+	poolReady chan struct{}
 }
 
 func main() {
@@ -104,6 +106,9 @@ func main() {
 
 	fmt.Println("ESTABLISHED")
 
+	s := newServerSession(conn, backendClient)
+	s.run()
+
 	mr, err := conn.AllocAndRegisterMR(64 * 1024 * 1024)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -117,9 +122,7 @@ func main() {
 		os.Exit(1)
 	}
 	fmt.Printf("MR base=0x%x rkey=0x%x size=%d\n", mr.Base, mr.RKey, mr.Size)
-
-	s := newServerSession(conn, pool, backendClient)
-	s.run()
+	s.setPool(pool)
 
 	if err := <-s.errCh; err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -127,18 +130,18 @@ func main() {
 	}
 }
 
-func newServerSession(conn *rdma.Conn, pool *bufpool.Pool, backendClient *backend.MinioBackend) *serverSession {
+func newServerSession(conn *rdma.Conn, backendClient *backend.MinioBackend) *serverSession {
 	s := &serverSession{
-		conn:     conn,
-		pool:     pool,
-		backend:  backendClient,
-		recvCh:   make(chan []byte, 256),
-		sendCh:   make(chan []byte, 256),
-		errCh:    make(chan error, 1),
-		sendBufs: make(map[uintptr][]byte),
-		putState: make(map[uint32]putState),
-		getState: make(map[uint32]getState),
-		workCh:   make(chan func(), 256),
+		conn:      conn,
+		backend:   backendClient,
+		recvCh:    make(chan []byte, 256),
+		sendCh:    make(chan []byte, 256),
+		errCh:     make(chan error, 1),
+		sendBufs:  make(map[uintptr][]byte),
+		putState:  make(map[uint32]putState),
+		getState:  make(map[uint32]getState),
+		workCh:    make(chan func(), 256),
+		poolReady: make(chan struct{}),
 	}
 	return s
 }
@@ -163,6 +166,16 @@ func (s *serverSession) run() {
 	go s.sendLoop()
 	go s.pollLoop()
 	go s.dispatchLoop()
+}
+
+func (s *serverSession) setPool(pool *bufpool.Pool) {
+	s.pool = pool
+	close(s.poolReady)
+}
+
+func (s *serverSession) waitPool() *bufpool.Pool {
+	<-s.poolReady
+	return s.pool
 }
 
 func (s *serverSession) sendLoop() {
@@ -257,11 +270,12 @@ func (s *serverSession) handleHello(hdr proto.MsgHdr) {
 }
 
 func (s *serverSession) handlePutReq(req proto.PutReq) {
-	lease, ok := s.pool.Acquire()
+	pool := s.waitPool()
+	lease, ok := pool.Acquire()
 	if !ok || lease.MaxLen < uint64(req.ObjLen) {
 		s.sendPutDone(req.ReqID, 1)
 		if ok {
-			_ = s.pool.Release(lease.Token)
+			_ = pool.Release(lease.Token)
 		}
 		return
 	}
@@ -313,19 +327,20 @@ func (s *serverSession) handlePutCommit(commit proto.PutCommit) {
 		sum := sha256.Sum256(payload)
 		if err := s.backend.Put(context.Background(), commit.Bucket, commit.Key, bytes.NewReader(payload), int64(commit.DataLen)); err != nil {
 			s.sendPutDone(commit.ReqID, 1)
-			_ = s.pool.Release(st.lease.Token)
+			_ = s.waitPool().Release(st.lease.Token)
 			s.clearPut(commit.ReqID)
 			return
 		}
 		fmt.Printf("PUT sha256=%s bucket=%s key=%s len=%d\n", hex.EncodeToString(sum[:]), commit.Bucket, commit.Key, commit.DataLen)
 		s.sendPutDone(commit.ReqID, 0)
-		_ = s.pool.Release(st.lease.Token)
+		_ = s.waitPool().Release(st.lease.Token)
 		s.clearPut(commit.ReqID)
 	}
 }
 
 func (s *serverSession) handleGetReq(req proto.GetReq) {
 	s.workCh <- func() {
+		pool := s.waitPool()
 		obj, size, err := s.backend.Get(context.Background(), req.Bucket, req.Key)
 		if err != nil {
 			return
@@ -341,15 +356,15 @@ func (s *serverSession) handleGetReq(req proto.GetReq) {
 		if int64(len(data)) != size {
 			return
 		}
-		lease, ok := s.pool.Acquire()
+		lease, ok := pool.Acquire()
 		if !ok || lease.MaxLen < uint64(size) {
 			if ok {
-				_ = s.pool.Release(lease.Token)
+				_ = pool.Release(lease.Token)
 			}
 			return
 		}
 		if err := rdma.CopyToAddr(lease.Addr, data); err != nil {
-			_ = s.pool.Release(lease.Token)
+			_ = pool.Release(lease.Token)
 			return
 		}
 
@@ -360,14 +375,14 @@ func (s *serverSession) handleGetReq(req proto.GetReq) {
 		ready := proto.GetReady{ReqID: req.ReqID, Token: lease.Token, Addr: lease.Addr, RKey: lease.RKey, DataLen: uint32(size)}
 		buf := s.allocSendBuf()
 		if buf == nil {
-			_ = s.pool.Release(lease.Token)
+			_ = pool.Release(lease.Token)
 			s.clearGet(req.ReqID)
 			return
 		}
 		wlen, err := proto.EncodeGetReady(buf, ready)
 		if err != nil {
 			rdma.FreeBuffer(buf)
-			_ = s.pool.Release(lease.Token)
+			_ = pool.Release(lease.Token)
 			s.clearGet(req.ReqID)
 			return
 		}
@@ -382,7 +397,7 @@ func (s *serverSession) handleGetDone(done proto.GetDone) {
 	if !ok || st.lease.Token != done.Token {
 		return
 	}
-	_ = s.pool.Release(st.lease.Token)
+	_ = s.waitPool().Release(st.lease.Token)
 	s.clearGet(done.ReqID)
 }
 
