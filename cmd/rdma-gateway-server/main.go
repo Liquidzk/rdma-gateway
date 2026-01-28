@@ -205,6 +205,7 @@ func (s *serverSession) dispatchLoop() {
 		if err != nil {
 			continue
 		}
+		fmt.Printf("CTRL recv type=%d req=%d len=%d\n", hdr.Type, hdr.ReqID, len(msg))
 		switch hdr.Type {
 		case proto.MsgHello:
 			s.handleHello(hdr)

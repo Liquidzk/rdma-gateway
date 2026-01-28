@@ -423,6 +423,7 @@ func doPut(s *clientSession, reqID uint32, bucket, key string, data []byte) erro
 		rdma.FreeBuffer(sendBuf)
 		return err
 	}
+	fmt.Printf("PUT req=%d send len=%d\n", reqID, len(data))
 	s.send(sendBuf[:n])
 
 	msg, err := s.waitMsg(ch, proto.MsgPutLease, 10*time.Second)

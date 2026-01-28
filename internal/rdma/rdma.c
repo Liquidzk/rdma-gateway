@@ -553,7 +553,7 @@ int rdma_poll(struct rdma_conn *conn, int *out_opcode, size_t *out_len, uint64_t
         return 1;
     }
     if (wc.status != IBV_WC_SUCCESS) {
-        snprintf(g_last_err, sizeof(g_last_err), "wc error status=%d", wc.status);
+        snprintf(g_last_err, sizeof(g_last_err), "wc error status=%d opcode=%d", wc.status, wc.opcode);
         return -1;
     }
     *out_opcode = wc.opcode;
