@@ -3,8 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -381,17 +379,16 @@ func (s *serverSession) handlePutCommit(commit proto.PutCommit) {
 
 	s.workCh <- func() {
 		start := time.Now()
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
 		s.markPutMinioStart(commit.ReqID)
-		payload, err := rdma.GoBytesFromAddr(st.lease.Addr, int(commit.DataLen))
+		payload, err := rdma.UnsafeSliceFromAddr(st.lease.Addr, int(commit.DataLen))
 		if err != nil {
 			s.sendPutDone(commit.ReqID, 1)
 			_ = s.pool.Release(st.lease.Token)
 			s.clearPut(commit.ReqID)
 			return
 		}
-		sum := sha256.Sum256(payload)
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
 		if err := s.backend.Put(ctx, commit.Bucket, commit.Key, bytes.NewReader(payload), int64(commit.DataLen)); err != nil {
 			fmt.Printf("PUT backend error req=%d err=%v\n", commit.ReqID, err)
 			s.markPutMinioDone(commit.ReqID)
@@ -401,7 +398,7 @@ func (s *serverSession) handlePutCommit(commit proto.PutCommit) {
 			return
 		}
 		s.markPutMinioDone(commit.ReqID)
-		fmt.Printf("PUT sha256=%s bucket=%s key=%s len=%d took=%s\n", hex.EncodeToString(sum[:]), commit.Bucket, commit.Key, commit.DataLen, time.Since(start))
+		fmt.Printf("PUT bucket=%s key=%s len=%d took=%s\n", commit.Bucket, commit.Key, commit.DataLen, time.Since(start))
 		s.sendPutDone(commit.ReqID, 0)
 		_ = s.waitPool().Release(st.lease.Token)
 		s.clearPut(commit.ReqID)
