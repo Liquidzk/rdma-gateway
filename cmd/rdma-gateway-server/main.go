@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -40,6 +41,7 @@ type serverSession struct {
 	conn    *rdma.Conn
 	pool    *bufpool.Pool
 	backend *backend.MinioBackend
+	timing  bool
 
 	recvCh chan []byte
 	sendCh chan []byte
@@ -55,6 +57,56 @@ type serverSession struct {
 	workCh chan func()
 
 	poolReady chan struct{}
+
+	timeMu   sync.Mutex
+	putTimes map[uint32]*putTiming
+	getTimes map[uint32]*getTiming
+}
+
+type putTiming struct {
+	S0 int64
+	S1 int64
+	S2 int64
+	S3 int64
+	S4 int64
+	S5 int64
+}
+
+type getTiming struct {
+	S0 int64
+	S1 int64
+	S2 int64
+	S3 int64
+	S4 int64
+}
+
+type timingServerPut struct {
+	Side string `json:"side"`
+	Op   string `json:"op"`
+	Req  uint32 `json:"req_id"`
+
+	S0 int64 `json:"s0_recv_req_ns"`
+	S1 int64 `json:"s1_send_lease_ns"`
+	S2 int64 `json:"s2_recv_commit_ns"`
+	S3 int64 `json:"s3_minio_start_ns"`
+	S4 int64 `json:"s4_minio_done_ns"`
+	S5 int64 `json:"s5_send_done_ns"`
+
+	TotalNS int64 `json:"total_ns"`
+}
+
+type timingServerGet struct {
+	Side string `json:"side"`
+	Op   string `json:"op"`
+	Req  uint32 `json:"req_id"`
+
+	S0 int64 `json:"s0_recv_req_ns"`
+	S1 int64 `json:"s1_minio_start_ns"`
+	S2 int64 `json:"s2_minio_done_ns"`
+	S3 int64 `json:"s3_send_ready_ns"`
+	S4 int64 `json:"s4_recv_done_ns"`
+
+	TotalNS int64 `json:"total_ns"`
 }
 
 func main() {
@@ -66,6 +118,7 @@ func main() {
 	minioEndpoint := fs.String("minio-endpoint", "http://127.0.0.1:9000", "MinIO endpoint URL")
 	accessKey := fs.String("access-key", "", "MinIO access key")
 	secretKey := fs.String("secret-key", "", "MinIO secret key")
+	timing := fs.Bool("timing", false, "Emit per-request timing JSON")
 
 	fs.Usage = func() {
 		fmt.Fprintf(fs.Output(), "Usage: %s [flags]\n\nFlags:\n", fs.Name())
@@ -107,7 +160,7 @@ func main() {
 
 	fmt.Println("ESTABLISHED")
 
-	s := newServerSession(conn, backendClient)
+	s := newServerSession(conn, backendClient, *timing)
 	s.run()
 
 	mr, err := conn.AllocAndRegisterMR(64 * 1024 * 1024)
@@ -131,10 +184,11 @@ func main() {
 	}
 }
 
-func newServerSession(conn *rdma.Conn, backendClient *backend.MinioBackend) *serverSession {
+func newServerSession(conn *rdma.Conn, backendClient *backend.MinioBackend, timing bool) *serverSession {
 	s := &serverSession{
 		conn:      conn,
 		backend:   backendClient,
+		timing:    timing,
 		recvCh:    make(chan []byte, 256),
 		sendCh:    make(chan []byte, 256),
 		errCh:     make(chan error, 1),
@@ -143,6 +197,8 @@ func newServerSession(conn *rdma.Conn, backendClient *backend.MinioBackend) *ser
 		getState:  make(map[uint32]getState),
 		workCh:    make(chan func(), 256),
 		poolReady: make(chan struct{}),
+		putTimes:  make(map[uint32]*putTiming),
+		getTimes:  make(map[uint32]*getTiming),
 	}
 	return s
 }
@@ -224,6 +280,7 @@ func (s *serverSession) dispatchLoop() {
 		case proto.MsgHello:
 			s.handleHello(hdr)
 		case proto.MsgPutReq:
+			s.markPutReq(hdr.ReqID)
 			req, err := proto.DecodePutReq(msg)
 			if err != nil {
 				continue
@@ -234,9 +291,11 @@ func (s *serverSession) dispatchLoop() {
 			if err != nil {
 				continue
 			}
+			s.markPutCommit(commit.ReqID)
 			fmt.Printf("PUT commit req=%d len=%d\n", commit.ReqID, commit.DataLen)
 			s.handlePutCommit(commit)
 		case proto.MsgGetReq:
+			s.markGetReq(hdr.ReqID)
 			req, err := proto.DecodeGetReq(msg)
 			if err != nil {
 				continue
@@ -247,6 +306,7 @@ func (s *serverSession) dispatchLoop() {
 			if err != nil {
 				continue
 			}
+			s.markGetDone(done.ReqID)
 			s.handleGetDone(done)
 		}
 	}
@@ -302,6 +362,7 @@ func (s *serverSession) handlePutReq(req proto.PutReq) {
 		s.clearPut(req.ReqID)
 		return
 	}
+	s.markPutLease(req.ReqID)
 	s.send(buf[:wlen])
 }
 
@@ -320,6 +381,7 @@ func (s *serverSession) handlePutCommit(commit proto.PutCommit) {
 
 	s.workCh <- func() {
 		start := time.Now()
+		s.markPutMinioStart(commit.ReqID)
 		payload, err := rdma.GoBytesFromAddr(st.lease.Addr, int(commit.DataLen))
 		if err != nil {
 			s.sendPutDone(commit.ReqID, 1)
@@ -332,11 +394,13 @@ func (s *serverSession) handlePutCommit(commit proto.PutCommit) {
 		defer cancel()
 		if err := s.backend.Put(ctx, commit.Bucket, commit.Key, bytes.NewReader(payload), int64(commit.DataLen)); err != nil {
 			fmt.Printf("PUT backend error req=%d err=%v\n", commit.ReqID, err)
+			s.markPutMinioDone(commit.ReqID)
 			s.sendPutDone(commit.ReqID, 1)
 			_ = s.waitPool().Release(st.lease.Token)
 			s.clearPut(commit.ReqID)
 			return
 		}
+		s.markPutMinioDone(commit.ReqID)
 		fmt.Printf("PUT sha256=%s bucket=%s key=%s len=%d took=%s\n", hex.EncodeToString(sum[:]), commit.Bucket, commit.Key, commit.DataLen, time.Since(start))
 		s.sendPutDone(commit.ReqID, 0)
 		_ = s.waitPool().Release(st.lease.Token)
@@ -347,6 +411,7 @@ func (s *serverSession) handlePutCommit(commit proto.PutCommit) {
 func (s *serverSession) handleGetReq(req proto.GetReq) {
 	s.workCh <- func() {
 		pool := s.waitPool()
+		s.markGetMinioStart(req.ReqID)
 		obj, size, err := s.backend.Get(context.Background(), req.Bucket, req.Key)
 		if err != nil {
 			return
@@ -362,6 +427,7 @@ func (s *serverSession) handleGetReq(req proto.GetReq) {
 		if int64(len(data)) != size {
 			return
 		}
+		s.markGetMinioDone(req.ReqID)
 		lease, ok := pool.Acquire()
 		if !ok || lease.MaxLen < uint64(size) {
 			if ok {
@@ -392,6 +458,7 @@ func (s *serverSession) handleGetReq(req proto.GetReq) {
 			s.clearGet(req.ReqID)
 			return
 		}
+		s.markGetReady(req.ReqID)
 		s.send(buf[:wlen])
 	}
 }
@@ -403,6 +470,7 @@ func (s *serverSession) handleGetDone(done proto.GetDone) {
 	if !ok || st.lease.Token != done.Token {
 		return
 	}
+	s.markGetDone(done.ReqID)
 	_ = s.waitPool().Release(st.lease.Token)
 	s.clearGet(done.ReqID)
 }
@@ -423,6 +491,7 @@ func (s *serverSession) sendPutDone(reqID uint32, status uint16) {
 		rdma.FreeBuffer(buf)
 		return
 	}
+	s.markPutDone(reqID)
 	s.send(buf[:wlen])
 }
 
@@ -452,6 +521,218 @@ func (s *serverSession) freeSend(buf []byte) {
 	if b != nil {
 		_ = s.conn.DeregisterBuffer(b)
 		rdma.FreeBuffer(b)
+	}
+}
+
+func (s *serverSession) emitJSON(v any) {
+	if !s.timing {
+		return
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return
+	}
+	fmt.Println(string(b))
+}
+
+func (s *serverSession) markPutReq(reqID uint32) {
+	if !s.timing {
+		return
+	}
+	s.timeMu.Lock()
+	defer s.timeMu.Unlock()
+	t := s.putTimes[reqID]
+	if t == nil {
+		t = &putTiming{}
+		s.putTimes[reqID] = t
+	}
+	if t.S0 == 0 {
+		t.S0 = time.Now().UnixNano()
+	}
+}
+
+func (s *serverSession) markPutLease(reqID uint32) {
+	if !s.timing {
+		return
+	}
+	s.timeMu.Lock()
+	defer s.timeMu.Unlock()
+	t := s.putTimes[reqID]
+	if t == nil {
+		t = &putTiming{}
+		s.putTimes[reqID] = t
+	}
+	if t.S1 == 0 {
+		t.S1 = time.Now().UnixNano()
+	}
+}
+
+func (s *serverSession) markPutCommit(reqID uint32) {
+	if !s.timing {
+		return
+	}
+	s.timeMu.Lock()
+	defer s.timeMu.Unlock()
+	t := s.putTimes[reqID]
+	if t == nil {
+		t = &putTiming{}
+		s.putTimes[reqID] = t
+	}
+	if t.S2 == 0 {
+		t.S2 = time.Now().UnixNano()
+	}
+}
+
+func (s *serverSession) markPutMinioStart(reqID uint32) {
+	if !s.timing {
+		return
+	}
+	s.timeMu.Lock()
+	defer s.timeMu.Unlock()
+	t := s.putTimes[reqID]
+	if t == nil {
+		t = &putTiming{}
+		s.putTimes[reqID] = t
+	}
+	if t.S3 == 0 {
+		t.S3 = time.Now().UnixNano()
+	}
+}
+
+func (s *serverSession) markPutMinioDone(reqID uint32) {
+	if !s.timing {
+		return
+	}
+	s.timeMu.Lock()
+	defer s.timeMu.Unlock()
+	t := s.putTimes[reqID]
+	if t == nil {
+		t = &putTiming{}
+		s.putTimes[reqID] = t
+	}
+	if t.S4 == 0 {
+		t.S4 = time.Now().UnixNano()
+	}
+}
+
+func (s *serverSession) markPutDone(reqID uint32) {
+	if !s.timing {
+		return
+	}
+	var out timingServerPut
+	s.timeMu.Lock()
+	t := s.putTimes[reqID]
+	if t != nil && t.S5 == 0 {
+		t.S5 = time.Now().UnixNano()
+		out = timingServerPut{
+			Side:    "server",
+			Op:      "rdma_put",
+			Req:     reqID,
+			S0:      t.S0,
+			S1:      t.S1,
+			S2:      t.S2,
+			S3:      t.S3,
+			S4:      t.S4,
+			S5:      t.S5,
+			TotalNS: t.S5 - t.S0,
+		}
+		delete(s.putTimes, reqID)
+	}
+	s.timeMu.Unlock()
+	if out.Req != 0 {
+		s.emitJSON(out)
+	}
+}
+
+func (s *serverSession) markGetReq(reqID uint32) {
+	if !s.timing {
+		return
+	}
+	s.timeMu.Lock()
+	defer s.timeMu.Unlock()
+	t := s.getTimes[reqID]
+	if t == nil {
+		t = &getTiming{}
+		s.getTimes[reqID] = t
+	}
+	if t.S0 == 0 {
+		t.S0 = time.Now().UnixNano()
+	}
+}
+
+func (s *serverSession) markGetMinioStart(reqID uint32) {
+	if !s.timing {
+		return
+	}
+	s.timeMu.Lock()
+	defer s.timeMu.Unlock()
+	t := s.getTimes[reqID]
+	if t == nil {
+		t = &getTiming{}
+		s.getTimes[reqID] = t
+	}
+	if t.S1 == 0 {
+		t.S1 = time.Now().UnixNano()
+	}
+}
+
+func (s *serverSession) markGetMinioDone(reqID uint32) {
+	if !s.timing {
+		return
+	}
+	s.timeMu.Lock()
+	defer s.timeMu.Unlock()
+	t := s.getTimes[reqID]
+	if t == nil {
+		t = &getTiming{}
+		s.getTimes[reqID] = t
+	}
+	if t.S2 == 0 {
+		t.S2 = time.Now().UnixNano()
+	}
+}
+
+func (s *serverSession) markGetReady(reqID uint32) {
+	if !s.timing {
+		return
+	}
+	s.timeMu.Lock()
+	defer s.timeMu.Unlock()
+	t := s.getTimes[reqID]
+	if t == nil {
+		t = &getTiming{}
+		s.getTimes[reqID] = t
+	}
+	if t.S3 == 0 {
+		t.S3 = time.Now().UnixNano()
+	}
+}
+
+func (s *serverSession) markGetDone(reqID uint32) {
+	if !s.timing {
+		return
+	}
+	var out timingServerGet
+	s.timeMu.Lock()
+	t := s.getTimes[reqID]
+	if t != nil && t.S4 == 0 {
+		t.S4 = time.Now().UnixNano()
+		out = timingServerGet{
+			Side:    "server",
+			Op:      "rdma_get",
+			Req:     reqID,
+			S0:      t.S0,
+			S1:      t.S1,
+			S2:      t.S2,
+			S3:      t.S3,
+			S4:      t.S4,
+			TotalNS: t.S4 - t.S0,
+		}
+		delete(s.getTimes, reqID)
+	}
+	s.timeMu.Unlock()
+	if out.Req != 0 {
+		s.emitJSON(out)
 	}
 }
 

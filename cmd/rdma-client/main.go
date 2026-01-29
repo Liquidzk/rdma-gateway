@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -41,6 +42,43 @@ type clientSession struct {
 
 	rdmaMu   sync.Mutex
 	rdmaWait map[uintptr]chan struct{}
+}
+
+type timingRDMA struct {
+	Side string `json:"side"`
+	Op   string `json:"op"`
+	Req  uint32 `json:"req_id"`
+
+	C0 int64 `json:"c0_send_req_ns"`
+	C1 int64 `json:"c1_recv_lease_ns"`
+	C2 int64 `json:"c2_rdma_done_ns"`
+	C3 int64 `json:"c3_send_commit_ns"`
+	C4 int64 `json:"c4_recv_done_ns"`
+
+	TotalNS int64 `json:"total_ns"`
+}
+
+type timingRDMAGet struct {
+	Side string `json:"side"`
+	Op   string `json:"op"`
+	Req  uint32 `json:"req_id"`
+
+	C0 int64 `json:"c0_send_req_ns"`
+	C1 int64 `json:"c1_recv_ready_ns"`
+	C2 int64 `json:"c2_rdma_done_ns"`
+	C3 int64 `json:"c3_send_done_ns"`
+
+	TotalNS int64 `json:"total_ns"`
+}
+
+type timingMinio struct {
+	Side    string `json:"side"`
+	Op      string `json:"op"`
+	Req     uint32 `json:"req_id"`
+	StartNS int64  `json:"start_ns"`
+	EndNS   int64  `json:"end_ns"`
+	TotalNS int64  `json:"total_ns"`
+	Size    int64  `json:"size"`
 }
 
 func main() {
@@ -424,7 +462,7 @@ func runPuts(s *clientSession, bucket, key, path string, concurrency, count int,
 			defer wg.Done()
 			for range tasks {
 				id := atomic.AddUint32(&reqID, 1)
-				dur, err := doPut(s, id, bucket, key, data)
+				dur, err := doPut(s, id, bucket, key, data, measure)
 				if err != nil {
 					errCh <- err
 					return
@@ -464,7 +502,7 @@ func runGets(s *clientSession, bucket, key, out string, concurrency, count int, 
 			for range tasks {
 				id := atomic.AddUint32(&reqID, 1)
 				outPath := outputPath(out, id, count)
-				dur, err := doGet(s, id, bucket, key, outPath)
+				dur, err := doGet(s, id, bucket, key, outPath, measure)
 				if err != nil {
 					errCh <- err
 					return
@@ -509,6 +547,14 @@ func reportTiming(label string, start time.Time, count int, durCh <-chan time.Du
 	}
 	avg := sum / time.Duration(n)
 	fmt.Printf("%s total=%s count=%d avg=%s\n", label, total, n, avg)
+}
+
+func emitJSON(v any) {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return
+	}
+	fmt.Println(string(b))
 }
 
 func newMinioClient(endpoint, accessKey, secretKey string) (*minio.Client, error) {
@@ -562,7 +608,7 @@ func runMinioPuts(endpoint, accessKey, secretKey, bucket, key, path string, conc
 			defer wg.Done()
 			for range tasks {
 				id := atomic.AddUint32(&reqID, 1)
-				dur, err := doMinioPut(client, bucket, key, path, id)
+				dur, err := doMinioPut(client, bucket, key, path, id, measure)
 				if err != nil {
 					errCh <- err
 					return
@@ -605,7 +651,7 @@ func runMinioGets(endpoint, accessKey, secretKey, bucket, key, out string, concu
 			for range tasks {
 				id := atomic.AddUint32(&reqID, 1)
 				outPath := outputPath(out, id, count)
-				dur, err := doMinioGet(client, bucket, key, outPath)
+				dur, err := doMinioGet(client, bucket, key, outPath, id, measure)
 				if err != nil {
 					errCh <- err
 					return
@@ -625,8 +671,13 @@ func runMinioGets(endpoint, accessKey, secretKey, bucket, key, out string, concu
 	}
 }
 
-func doMinioPut(client *minio.Client, bucket, key, path string, reqID uint32) (time.Duration, error) {
+func doMinioPut(client *minio.Client, bucket, key, path string, reqID uint32, measure bool) (time.Duration, error) {
 	start := time.Now()
+	var t timingMinio
+	if measure {
+		t = timingMinio{Side: "client", Op: "minio_put", Req: reqID}
+		t.StartNS = time.Now().UnixNano()
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		return 0, err
@@ -641,11 +692,22 @@ func doMinioPut(client *minio.Client, bucket, key, path string, reqID uint32) (t
 		return 0, err
 	}
 	fmt.Printf("MINIO PUT OK req=%d size=%d\n", reqID, st.Size())
+	if measure {
+		t.EndNS = time.Now().UnixNano()
+		t.TotalNS = t.EndNS - t.StartNS
+		t.Size = st.Size()
+		emitJSON(t)
+	}
 	return time.Since(start), nil
 }
 
-func doMinioGet(client *minio.Client, bucket, key, out string) (time.Duration, error) {
+func doMinioGet(client *minio.Client, bucket, key, out string, reqID uint32, measure bool) (time.Duration, error) {
 	start := time.Now()
+	var t timingMinio
+	if measure {
+		t = timingMinio{Side: "client", Op: "minio_get", Req: reqID}
+		t.StartNS = time.Now().UnixNano()
+	}
 	obj, err := client.GetObject(context.Background(), bucket, key, minio.GetObjectOptions{})
 	if err != nil {
 		return 0, err
@@ -662,11 +724,21 @@ func doMinioGet(client *minio.Client, bucket, key, out string) (time.Duration, e
 	if _, err := io.Copy(f, obj); err != nil {
 		return 0, err
 	}
+	if measure {
+		t.EndNS = time.Now().UnixNano()
+		t.TotalNS = t.EndNS - t.StartNS
+		emitJSON(t)
+	}
 	return time.Since(start), nil
 }
 
-func doPut(s *clientSession, reqID uint32, bucket, key string, data []byte) (time.Duration, error) {
+func doPut(s *clientSession, reqID uint32, bucket, key string, data []byte, measure bool) (time.Duration, error) {
 	start := time.Now()
+	var t timingRDMA
+	if measure {
+		t = timingRDMA{Side: "client", Op: "rdma_put", Req: reqID}
+		t.C0 = time.Now().UnixNano()
+	}
 	ch := s.registerReq(reqID)
 	defer s.unregisterReq(reqID)
 
@@ -691,6 +763,9 @@ func doPut(s *clientSession, reqID uint32, bucket, key string, data []byte) (tim
 	if err != nil {
 		return 0, err
 	}
+	if measure {
+		t.C1 = time.Now().UnixNano()
+	}
 	if lease.MaxLen < uint32(len(data)) {
 		return 0, fmt.Errorf("object too large for lease")
 	}
@@ -712,6 +787,9 @@ func doPut(s *clientSession, reqID uint32, bucket, key string, data []byte) (tim
 		rdma.FreeBuffer(local)
 		return 0, err
 	}
+	if measure {
+		t.C2 = time.Now().UnixNano()
+	}
 	_ = s.conn.DeregisterBuffer(local)
 	rdma.FreeBuffer(local)
 
@@ -726,6 +804,9 @@ func doPut(s *clientSession, reqID uint32, bucket, key string, data []byte) (tim
 		return 0, err
 	}
 	s.send(sendBuf2[:n])
+	if measure {
+		t.C3 = time.Now().UnixNano()
+	}
 
 	msg, err = s.waitMsg(ch, proto.MsgPutDone, 10*time.Second)
 	if err != nil {
@@ -738,14 +819,24 @@ func doPut(s *clientSession, reqID uint32, bucket, key string, data []byte) (tim
 	if done.Status != 0 {
 		return 0, fmt.Errorf("put failed status=%d", done.Status)
 	}
+	if measure {
+		t.C4 = time.Now().UnixNano()
+		t.TotalNS = t.C4 - t.C0
+		emitJSON(t)
+	}
 
 	sum := sha256.Sum256(data)
 	fmt.Printf("PUT OK req=%d sha256=%x\n", reqID, sum)
 	return time.Since(start), nil
 }
 
-func doGet(s *clientSession, reqID uint32, bucket, key, out string) (time.Duration, error) {
+func doGet(s *clientSession, reqID uint32, bucket, key, out string, measure bool) (time.Duration, error) {
 	start := time.Now()
+	var t timingRDMAGet
+	if measure {
+		t = timingRDMAGet{Side: "client", Op: "rdma_get", Req: reqID}
+		t.C0 = time.Now().UnixNano()
+	}
 	if out == "" {
 		return 0, fmt.Errorf("missing --out")
 	}
@@ -772,6 +863,9 @@ func doGet(s *clientSession, reqID uint32, bucket, key, out string) (time.Durati
 	if err != nil {
 		return 0, err
 	}
+	if measure {
+		t.C1 = time.Now().UnixNano()
+	}
 	if ready.DataLen == 0 {
 		return 0, fmt.Errorf("empty object")
 	}
@@ -790,6 +884,9 @@ func doGet(s *clientSession, reqID uint32, bucket, key, out string) (time.Durati
 		_ = s.conn.DeregisterBuffer(local)
 		rdma.FreeBuffer(local)
 		return 0, err
+	}
+	if measure {
+		t.C2 = time.Now().UnixNano()
 	}
 	if err := os.WriteFile(out, local, 0o644); err != nil {
 		_ = s.conn.DeregisterBuffer(local)
@@ -812,6 +909,11 @@ func doGet(s *clientSession, reqID uint32, bucket, key, out string) (time.Durati
 		return 0, err
 	}
 	s.send(sendBuf2[:n])
+	if measure {
+		t.C3 = time.Now().UnixNano()
+		t.TotalNS = t.C3 - t.C0
+		emitJSON(t)
+	}
 	return time.Since(start), nil
 }
 
