@@ -69,6 +69,7 @@ type timingRDMAGet struct {
 	C3 int64 `json:"c3_send_done_ns"`
 
 	TotalNS int64 `json:"total_ns"`
+	Size    int64 `json:"size"`
 }
 
 type timingMinio struct {
@@ -396,6 +397,9 @@ func (s *clientSession) send(buf []byte) {
 }
 
 func (s *clientSession) freeSend(buf []byte) {
+	if len(buf) == 0 {
+		return
+	}
 	ptr := uintptr(unsafe.Pointer(&buf[0]))
 	s.sendMu.Lock()
 	b := s.sendBufs[ptr]
@@ -713,20 +717,15 @@ func doMinioGet(client *minio.Client, bucket, key, out string, reqID uint32, mea
 		return 0, err
 	}
 	defer obj.Close()
-	if out == "" {
-		return 0, fmt.Errorf("missing --out")
-	}
-	f, err := os.Create(out)
+	_ = out
+	n, err := io.Copy(io.Discard, obj)
 	if err != nil {
-		return 0, err
-	}
-	defer f.Close()
-	if _, err := io.Copy(f, obj); err != nil {
 		return 0, err
 	}
 	if measure {
 		t.EndNS = time.Now().UnixNano()
 		t.TotalNS = t.EndNS - t.StartNS
+		t.Size = n
 		emitJSON(t)
 	}
 	return time.Since(start), nil
@@ -837,9 +836,7 @@ func doGet(s *clientSession, reqID uint32, bucket, key, out string, measure bool
 		t = timingRDMAGet{Side: "client", Op: "rdma_get", Req: reqID}
 		t.C0 = time.Now().UnixNano()
 	}
-	if out == "" {
-		return 0, fmt.Errorf("missing --out")
-	}
+	_ = out
 	ch := s.registerReq(reqID)
 	defer s.unregisterReq(reqID)
 
@@ -869,6 +866,9 @@ func doGet(s *clientSession, reqID uint32, bucket, key, out string, measure bool
 	if ready.DataLen == 0 {
 		return 0, fmt.Errorf("empty object")
 	}
+	if measure {
+		t.Size = int64(ready.DataLen)
+	}
 
 	local, err := rdma.AllocBuffer(int(ready.DataLen))
 	if err != nil {
@@ -888,13 +888,7 @@ func doGet(s *clientSession, reqID uint32, bucket, key, out string, measure bool
 	if measure {
 		t.C2 = time.Now().UnixNano()
 	}
-	if err := os.WriteFile(out, local, 0o644); err != nil {
-		_ = s.conn.DeregisterBuffer(local)
-		rdma.FreeBuffer(local)
-		return 0, err
-	}
-	sum := sha256.Sum256(local)
-	fmt.Printf("GET OK req=%d sha256=%x\n", reqID, sum)
+	fmt.Printf("GET OK req=%d size=%d\n", reqID, ready.DataLen)
 	_ = s.conn.DeregisterBuffer(local)
 	rdma.FreeBuffer(local)
 

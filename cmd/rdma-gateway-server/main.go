@@ -417,14 +417,6 @@ func (s *serverSession) handleGetReq(req proto.GetReq) {
 		if size <= 0 {
 			return
 		}
-		data, err := io.ReadAll(obj)
-		if err != nil {
-			return
-		}
-		if int64(len(data)) != size {
-			return
-		}
-		s.markGetMinioDone(req.ReqID)
 		lease, ok := pool.Acquire()
 		if !ok || lease.MaxLen < uint64(size) {
 			if ok {
@@ -432,10 +424,17 @@ func (s *serverSession) handleGetReq(req proto.GetReq) {
 			}
 			return
 		}
-		if err := rdma.CopyToAddr(lease.Addr, data); err != nil {
+		writer, err := rdma.NewCBufferWriter(lease.Addr, int(size))
+		if err != nil {
 			_ = pool.Release(lease.Token)
 			return
 		}
+		written, err := io.CopyN(writer, obj, size)
+		if err != nil || written != size {
+			_ = pool.Release(lease.Token)
+			return
+		}
+		s.markGetMinioDone(req.ReqID)
 
 		s.stateMu.Lock()
 		s.getState[req.ReqID] = getState{lease: lease}

@@ -21,10 +21,11 @@ type Listener struct {
 }
 
 type Conn struct {
-	h   *C.struct_rdma_conn
-	mu  sync.Mutex
-	mrs map[uintptr]*C.struct_ibv_mr
-	buf map[uintptr][]byte
+	h       *C.struct_rdma_conn
+	mu      sync.Mutex
+	mrs     map[uintptr]*C.struct_ibv_mr
+	buf     map[uintptr][]byte
+	closing bool
 }
 
 type MR struct {
@@ -93,12 +94,14 @@ func (c *Conn) Close() error {
 		return nil
 	}
 	c.mu.Lock()
-	for _, mr := range c.mrs {
-		_ = C.rdma_dereg_mr(mr)
-	}
+	c.closing = true
+	mrs := c.mrs
 	c.mrs = nil
 	c.buf = nil
 	c.mu.Unlock()
+	for _, mr := range mrs {
+		_ = C.rdma_dereg_mr(mr)
+	}
 
 	if C.rdma_conn_close(c.h) != 0 {
 		return fmt.Errorf("rdma_conn_close: %s", C.GoString(C.rdma_last_error()))
@@ -133,6 +136,13 @@ func (c *Conn) ensureMR(buf []byte) (*C.struct_ibv_mr, uintptr, error) {
 	ptr := uintptr(unsafe.Pointer(&buf[0]))
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.closing {
+		return nil, 0, fmt.Errorf("conn is closing")
+	}
+	if c.mrs == nil {
+		c.mrs = make(map[uintptr]*C.struct_ibv_mr)
+		c.buf = make(map[uintptr][]byte)
+	}
 	if mr, ok := c.mrs[ptr]; ok {
 		return mr, ptr, nil
 	}
@@ -151,6 +161,10 @@ func (c *Conn) DeregisterBuffer(buf []byte) error {
 	}
 	ptr := uintptr(unsafe.Pointer(&buf[0]))
 	c.mu.Lock()
+	if c.closing {
+		c.mu.Unlock()
+		return nil
+	}
 	mr := c.mrs[ptr]
 	delete(c.mrs, ptr)
 	delete(c.buf, ptr)
